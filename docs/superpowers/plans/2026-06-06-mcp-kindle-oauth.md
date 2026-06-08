@@ -236,6 +236,17 @@ RSpec.describe "Dynamic Client Registration", type: :request do
     expect(response).to have_http_status(:bad_request)
     expect(JSON.parse(response.body)["error"]).to eq("invalid_redirect_uri")
   end
+
+  it "rejects non-loopback redirect_uris" do
+    post "/oauth/register", params: {
+      client_name: "Bad Client",
+      redirect_uris: ["https://example.com/callback"],
+      token_endpoint_auth_method: "none"
+    }.to_json, headers: { "Content-Type" => "application/json" }
+
+    expect(response).to have_http_status(:bad_request)
+    expect(JSON.parse(response.body)["error"]).to eq("invalid_redirect_uri")
+  end
 end
 ```
 
@@ -257,13 +268,17 @@ post "/oauth/register", to: "mcp/registrations#create"
 Create `app/controllers/mcp/registrations_controller.rb`:
 
 ```ruby
+require "uri"
+
 module Mcp
   class RegistrationsController < ActionController::API
+    LOOPBACK_HOSTS = %w[localhost 127.0.0.1 ::1].freeze
+
     def create
       redirect_uris = Array(params[:redirect_uris]).map(&:to_s).reject(&:blank?)
-      if redirect_uris.empty?
+      if redirect_uris.empty? || redirect_uris.any? { |uri| !loopback_redirect_uri?(uri) }
         return render json: { error: "invalid_redirect_uri",
-                              error_description: "redirect_uris is required" },
+                              error_description: "redirect_uris must be loopback HTTP /callback URLs" },
                       status: :bad_request
       end
 
@@ -289,6 +304,17 @@ module Mcp
         response_types: ["code"],
         client_name: app.name
       }, status: :created
+    end
+
+    private
+
+    def loopback_redirect_uri?(uri)
+      parsed = URI.parse(uri)
+      parsed.scheme == "http" &&
+        LOOPBACK_HOSTS.include?(parsed.host) &&
+        parsed.path == "/callback"
+    rescue URI::InvalidURIError
+      false
     end
   end
 end
@@ -636,27 +662,39 @@ git commit -m "feat(mcp): OTP verify + 30s-gated resend in auth-session flow"
 
 > Proves at E2E time (in the solid_queue worker pane, which runs `RAILS_LOG_TO_STDOUT=1`) that the EPUB was actually handed to Mailgun.
 
-- [ ] **Step 1: Read the existing client**
+- [ ] **Step 1: Confirm the existing client shape**
 
 Run: `cat app/services/mailgun_email_client.rb`
-Expected: see the method that sends via Mailgun (e.g. `call`/`send_message`) and its recipient/subject variables.
+Expected: see `MailgunEmailClient.call(to_attributes:, from_attributes:, subject:, body:, attachments: [])`.
 
 - [ ] **Step 2: Write the failing test**
 
-Create `spec/services/mailgun_email_client_spec.rb`. Adapt the public method name and arguments to what Step 1 revealed; the assertion is that a `[MailgunEmailClient] delivering` line is written to STDOUT with the recipient. Example shape (adjust the call to the real signature):
+Create `spec/services/mailgun_email_client_spec.rb`:
 
 ```ruby
 require "rails_helper"
+require "tmpdir"
 
 RSpec.describe MailgunEmailClient do
   it "logs a delivery line to STDOUT including the recipient" do
-    # Stub the actual Mailgun HTTP send so the test is offline.
-    allow_any_instance_of(described_class).to receive(:deliver_via_mailgun).and_return(true)
+    mailgun_client = instance_double(Mailgun::Client, send_message: true)
+    allow(Mailgun::Client).to receive(:new).and_return(mailgun_client)
+
+    dir = Dir.mktmpdir
+    epub_path = File.join(dir, "Example Article.epub")
+    File.write(epub_path, "epub")
 
     expect {
-      # Replace with the real public entrypoint + args discovered in Step 1:
-      described_class.new.call(to: "reader@kindle.com", subject: "Hi", epub_path: "/tmp/x.epub")
-    }.to output(/\[MailgunEmailClient\] delivering .*reader@kindle\.com/).to_stdout
+      described_class.call(
+        to_attributes: [:to, "reader@kindle.com"],
+        from_attributes: [SENDER_EMAIL, { first: "Read It", last: "Soon" }],
+        subject: "Example Article",
+        body: "Body",
+        attachments: [{ path: epub_path, name: "Example Article.epub" }]
+      )
+    }.to output(/\[MailgunEmailClient\] delivering 'Example Article' to reader@kindle\.com \(Example Article\.epub\)/).to_stdout
+  ensure
+    FileUtils.remove_entry(dir) if dir && Dir.exist?(dir)
   end
 end
 ```
@@ -664,17 +702,19 @@ end
 - [ ] **Step 3: Run it, verify it fails**
 
 Run: `bundle exec rspec spec/services/mailgun_email_client_spec.rb`
-Expected: FAIL (no STDOUT line; possibly also adjust stubbed method name to the real one).
+Expected: FAIL (no STDOUT line).
 
 - [ ] **Step 4: Add the STDOUT log**
 
-In `app/services/mailgun_email_client.rb`, at the start of the public send method (the one that performs the Mailgun POST), add:
+In `app/services/mailgun_email_client.rb`, at the start of `self.call`, add:
 
 ```ruby
-    $stdout.puts("[MailgunEmailClient] delivering '#{subject}' to #{to} (#{File.basename(epub_path.to_s)})")
+    recipient = Array(to_attributes).last
+    attachment_name = attachments.first&.[](:name) || "no attachment"
+    $stdout.puts("[MailgunEmailClient] delivering '#{subject}' to #{recipient} (#{attachment_name})")
 ```
 
-Use the actual local variable / parameter names from Step 1 (`recipient`/`to`, `subject`, attachment path). Keep it a single line; do not change delivery behavior.
+Keep the log before the Mailgun `send_message` call; do not change delivery behavior.
 
 - [ ] **Step 5: Run the test, verify pass**
 
@@ -694,10 +734,10 @@ git commit -m "feat(mcp): log mailgun delivery to STDOUT for E2E verification"
 
 **Files:**
 - Create: `app/mcp/send_markdown_to_kindle_tool.rb`
-- Modify: `config/application.rb` (ensure `app/mcp` is autoloaded — usually automatic under `app/`)
 - Test: `spec/mcp/send_markdown_to_kindle_tool_spec.rb`
 
 > The tool reads the authenticated `Email` via `server_context[:email_id]`. Title comes from `filename` (basename minus extension). Author: caller value, else email local-part. It reuses the existing pipeline by creating an `Article` and enqueuing `DeliveryJob` (same as `ArticlesController#send_to_kindle`).
+> Rails autoloads `app/mcp/send_markdown_to_kindle_tool.rb` as the top-level `SendMarkdownToKindleTool`; no `config/application.rb` change is needed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -707,10 +747,23 @@ Create `spec/mcp/send_markdown_to_kindle_tool_spec.rb`:
 require "rails_helper"
 
 RSpec.describe SendMarkdownToKindleTool do
+  include ActiveJob::TestHelper
+
   def ctx(email) = { email_id: email.id }
 
+  around do |example|
+    original_adapter = ActiveJob::Base.queue_adapter
+    ActiveJob::Base.queue_adapter = :test
+    clear_enqueued_jobs
+    example.run
+  ensure
+    clear_enqueued_jobs
+    clear_performed_jobs
+    ActiveJob::Base.queue_adapter = original_adapter
+  end
+
   it "enqueues delivery, sets title from filename, passes author" do
-    email = Email.create!(email: "reader@kindle.com")
+    email = create(:email, email: "reader@kindle.com")
     expect {
       resp = described_class.call(
         markdown: "# Hello\n\nBody", filename: "notes/Hello.md", author: "Jane",
@@ -727,28 +780,30 @@ RSpec.describe SendMarkdownToKindleTool do
   end
 
   it "defaults author to the email local-part when omitted" do
-    email = Email.create!(email: "reader@kindle.com")
+    email = create(:email, email: "reader@kindle.com")
     described_class.call(markdown: "# X", filename: "X.md", server_context: ctx(email))
     expect(email.articles.last.author).to eq("reader")
   end
 
   it "returns an error response for empty markdown" do
-    email = Email.create!(email: "reader@kindle.com")
+    email = create(:email, email: "reader@kindle.com")
     resp = described_class.call(markdown: "   ", filename: "X.md", server_context: ctx(email))
     expect(resp.error?).to be(true)
   end
 
   it "returns an error response when the monthly limit is reached" do
-    email = Email.create!(email: "reader@kindle.com")
-    allow_any_instance_of(Email).to receive(:articles_in_period).and_return(9999)
-    allow_any_instance_of(Email).to receive(:max_articles_per_month).and_return(10)
-    resp = described_class.call(markdown: "# X", filename: "X.md", server_context: ctx(email))
-    expect(resp.error?).to be(true)
+    email = create(:email, :with_subscription_period, email: "reader@kindle.com", max_articles_per_month: 1)
+    create(:article, email: email, sent_status: :delivered, sent_at: Time.current)
+
+    expect {
+      resp = described_class.call(markdown: "# X", filename: "X.md", server_context: ctx(email))
+      expect(resp.error?).to be(true)
+    }.not_to have_enqueued_job(DeliveryJob)
   end
 end
 ```
 
-> Note: confirm the `MCP::Tool::Response` error predicate name with `bundle exec ruby -e "require 'mcp'; puts MCP::Tool::Response.instance_methods(false)"`. If it is not `error?`, adjust the spec and tool to the real accessor (the constructor keyword is `error:` per the SDK docs).
+`MCP::Tool::Response#error?` is the supported predicate for responses built with `error: true`.
 
 - [ ] **Step 2: Run it, verify it fails**
 
@@ -838,8 +893,10 @@ Create `spec/requests/mcp/server_spec.rb`:
 require "rails_helper"
 
 RSpec.describe "Mcp::Server endpoint", type: :request do
+  include ActiveJob::TestHelper
+
   def token_for(email)
-    app = Doorkeeper::Application.create!(name: "c", redirect_uri: "http://127.0.0.1/cb", confidential: false)
+    app = Doorkeeper::Application.create!(name: "c", redirect_uri: "http://127.0.0.1/callback", confidential: false)
     Doorkeeper::AccessToken.create!(application: app, resource_owner_id: email.id, expires_in: 3600, scopes: "")
   end
 
@@ -849,13 +906,25 @@ RSpec.describe "Mcp::Server endpoint", type: :request do
 
   let(:headers) { { "Content-Type" => "application/json", "Accept" => "application/json, text/event-stream" } }
 
+  around do |example|
+    original_adapter = ActiveJob::Base.queue_adapter
+    ActiveJob::Base.queue_adapter = :test
+    clear_enqueued_jobs
+    example.run
+  ensure
+    clear_enqueued_jobs
+    clear_performed_jobs
+    ActiveJob::Base.queue_adapter = original_adapter
+  end
+
   it "401s without a bearer token" do
     post "/mcp", params: jsonrpc("tools/list").to_json, headers: headers
     expect(response).to have_http_status(:unauthorized)
+    expect(response.headers["WWW-Authenticate"]).to include(%(resource_metadata="http://www.example.com/.well-known/oauth-protected-resource"))
   end
 
   it "lists the send tool for an authenticated client" do
-    email = Email.create!(email: "reader@kindle.com")
+    email = create(:email, email: "reader@kindle.com")
     token = token_for(email)
     post "/mcp", params: jsonrpc("tools/list").to_json,
          headers: headers.merge("Authorization" => "Bearer #{token.token}")
@@ -866,7 +935,7 @@ RSpec.describe "Mcp::Server endpoint", type: :request do
   end
 
   it "calls the tool and enqueues delivery to the token's kindle email" do
-    email = Email.create!(email: "reader@kindle.com")
+    email = create(:email, email: "reader@kindle.com")
     token = token_for(email)
     expect {
       post "/mcp",
@@ -901,7 +970,7 @@ Create `app/controllers/mcp/server_controller.rb`:
 module Mcp
   class ServerController < ActionController::API
     include Doorkeeper::Rails::Helpers
-    before_action -> { doorkeeper_authorize! }
+    before_action :authorize_mcp!
 
     def create
       server = MCP::Server.new(
@@ -918,11 +987,28 @@ module Mcp
       response.headers.merge!(headers || {})
       render(json: body&.first, status: status)
     end
+
+    private
+
+    def authorize_mcp!
+      doorkeeper_authorize!
+    ensure
+      attach_resource_metadata_challenge if response.status == 401
+    end
+
+    def attach_resource_metadata_challenge
+      metadata_url = "#{request.base_url}/.well-known/oauth-protected-resource"
+      challenge = response.headers["WWW-Authenticate"].presence || "Bearer"
+      return if challenge.include?("resource_metadata=")
+
+      separator = challenge == "Bearer" ? " " : ", "
+      response.headers["WWW-Authenticate"] = %(#{challenge}#{separator}resource_metadata="#{metadata_url}")
+    end
   end
 end
 ```
 
-> If `transport.handle_request` expects a different request object or returns a body that is already serialized, adjust per `bundle exec ruby -e "require 'mcp'; puts MCP::Server::Transports::StreamableHTTPTransport.instance_method(:handle_request).source_location"` and the gem README. The contract used here (`[status, headers, body]`, render `body.first`) matches the documented Rails example.
+The MCP Ruby SDK's Rails controller example uses this contract: `transport.handle_request(request)` returns `[status, headers, body]`, and the Rails response renders `body.first`.
 
 - [ ] **Step 5: Run the tests, verify pass**
 
@@ -973,12 +1059,17 @@ In `../readitsoon/.worktrees/mcp-oauth` (so the new code is live): run `./serve-
 ```bash
 curl -s http://localhost:4001/.well-known/oauth-protected-resource | jq .
 curl -s -i -X POST http://localhost:4001/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -1   # expect 401
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -E 'HTTP/|WWW-Authenticate'
 ```
 
-- [ ] **V3: Create the test markdown fixture (in readitsoon-mcp repo)**
+Expected: `HTTP/1.1 401 Unauthorized` and a `WWW-Authenticate` challenge containing
+`resource_metadata="http://localhost:4001/.well-known/oauth-protected-resource"`.
 
-Create `fixtures/sample-article.md` with a title heading + a few random paragraphs.
+- [ ] **V3: Verify the test markdown fixture (in readitsoon-mcp repo)**
+
+Verify `fixtures/sample-article.md` already exists and contains:
+- H1: `The Quiet Hour Before Dawn`
+- Byline: `by Guillermo Siliceo`
 
 - [ ] **V4: Register the MCP server with Claude + complete OAuth (pre-auth)**
 
@@ -986,7 +1077,12 @@ Create `fixtures/sample-article.md` with a title heading + a few random paragrap
 claude mcp add --transport http readitsoon http://localhost:4001/mcp
 ```
 
-Then trigger the interactive auth (the `/mcp` auth flow). When Claude prints the authorization URL:
+Then trigger interactive auth:
+- Run `claude` in the terminal.
+- Inside Claude Code, type `/mcp`.
+- Select `readitsoon` and choose the authenticate/connect action.
+
+When Claude prints or opens the authorization URL:
 - Open it with the browser (chrome-devtools MCP `new_page`/`navigate_page`).
 - Enter `guillermo.siliceo@kindle.com`, submit.
 - Read the OTP from the **Rails serve-dev pane STDOUT** (`[MCP OTP] guillermo.siliceo@kindle.com: <code>`).
@@ -996,22 +1092,23 @@ Then trigger the interactive auth (the `/mcp` auth flow). When Claude prints the
 - [ ] **V5: Send the file via the headless agent**
 
 ```bash
-claude -p "Use the readitsoon MCP tool send_markdown_to_kindle to send the file fixtures/sample-article.md to my Kindle. Use the file's H1 as context; infer the author from the content." \
-  --model "$MODEL" --system-prompt "$SYSTEM_PROMPT" --output-format json
+claude -p "Read fixtures/sample-article.md, then use the readitsoon MCP tool send_markdown_to_kindle. Pass markdown as the full file contents, filename as 'The Quiet Hour Before Dawn.md' so the EPUB title matches the H1, and author as 'Guillermo Siliceo' from the byline." \
+  --output-format json
 ```
 
-(`MODEL`/`SYSTEM_PROMPT` are the values the user supplies for the run.) Confirm the JSON output shows the tool was called and returned "Sending '…' to guillermo.siliceo@kindle.com."
+Confirm the JSON output shows the tool was called and returned:
+`Sending 'The Quiet Hour Before Dawn' to guillermo.siliceo@kindle.com.`
 
 - [ ] **V6: Verify delivery actually happened**
 
 In the **solid_queue worker pane** STDOUT, confirm:
-`[MailgunEmailClient] delivering '<title>' to guillermo.siliceo@kindle.com (<file>.epub)`
+`[MailgunEmailClient] delivering 'The Quiet Hour Before Dawn' to guillermo.siliceo@kindle.com (The Quiet Hour Before Dawn.epub)`
 This proves the EPUB was handed to Mailgun (Task 6 log). Done = this line appears for the test send.
 
 ---
 
 ## Self-Review Notes (resolved)
 
-- **Spec coverage:** Rails-only re-scope (whole plan), official ruby-sdk + controller (T7/T8), local token validation via doorkeeper_authorize! (T8), DCR (T3), AS + protected-resource metadata (T2), OTP login + whitelist + dev STDOUT echo (T4), 30s resend (T5), MailgunEmailClient STDOUT log (T6), tool incl. author inference + title-from-filename (T7), reuse map (T7), localhost:4001 + serve-dev + claude mcp add + browser OTP (E2E). All covered.
+- **Spec coverage:** Rails-only re-scope (whole plan), official ruby-sdk + controller (T7/T8), local token validation via doorkeeper_authorize! (T8), DCR with loopback redirect validation (T3), AS + protected-resource metadata (T2), OTP login + whitelist + dev STDOUT echo (T4), 30s resend (T5), MailgunEmailClient STDOUT log (T6), tool with caller-supplied author + title-from-filename (T7), reuse map (T7), localhost:4001 + serve-dev + claude mcp add + browser OTP + deterministic fixture send (E2E). All covered.
 - **Type consistency:** `server_context[:email_id]` set in T8, read in T7. `SendMarkdownToKindleTool` name consistent T7/T8. `title_from`/`error` are T7-private. Tool name string `send_markdown_to_kindle` consistent T7/T8/E2E.
-- **Known version risks (each has an inline probe + fallback):** (1) `MCP::Tool::Response` error predicate name (T7 note). (2) `StreamableHTTPTransport#handle_request` return/contract (T8 note). (3) Doorkeeper public-client + `force_pkce` token issuance in specs (tokens created directly in specs to avoid PKCE friction). (4) `claude mcp` interactive-auth exact subcommand for triggering re-auth (V4 — use `claude mcp list`/reconnect if the add step doesn't prompt).
+- **Resolved ambiguity pass:** `MCP::Tool::Response#error?` and `StreamableHTTPTransport#handle_request(request)` are now fixed to the current Ruby SDK contract; Task 6 uses the real `MailgunEmailClient.call(...)` signature; Active Job test adapter setup is explicit in specs using `have_enqueued_job`; E2E no longer depends on external `MODEL`/`SYSTEM_PROMPT` values.
